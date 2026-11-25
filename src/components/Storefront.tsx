@@ -1000,34 +1000,46 @@ export const Storefront: React.FC<StorefrontProps> = ({
           {/* About Us Section */}
           <section id="about" className="max-w-[1280px] mx-auto w-full px-4 sm:px-6 lg:px-10 py-12 lg:py-20">
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-10 lg:gap-16 items-center">
-              <div className="lg:col-span-6 relative pb-4 sm:pb-8 sm:pr-8">
-                <div className="relative rounded-[8px] overflow-hidden aspect-[4/4] max-w-[500px] mx-auto lg:mx-0 bg-[#F3F5F4]">
-                  <img
-                    src={
-                      settings.missionImageUrl ||
-                      'https://i.ibb.co/GQdg80PP/leadership-photo.png'
-                    }
-                    alt="Emmystylez Solar Leadership — Make Solar Energy Accessible"
-                    referrerPolicy="no-referrer"
-                    className="w-full h-full object-cover object-top"
-                  />
-                </div>
+              <div className="lg:col-span-6 relative sm:pr-6">
+                <div className="relative max-w-[440px] mx-auto lg:mx-0">
+                  <div className="relative rounded-t-[10px] overflow-hidden aspect-[3/4] bg-[#F3F5F4] border border-b-0 border-neutral-200/80 shadow-sm">
+                    <img
+                      src={
+                        settings.missionImageUrl &&
+                        !settings.missionImageUrl.includes('i.ibb.co/GQdg80PP/leadership-photo.png')
+                          ? settings.missionImageUrl
+                          : '/src/assets/images/leadership-photo.png'
+                      }
+                      alt={`${settings.storeName} Leadership — Make Solar Energy Accessible`}
+                      referrerPolicy="no-referrer"
+                      loading="eager"
+                      decoding="async"
+                      onError={(e) => {
+                        const fallback = '/src/assets/images/leadership-photo.png';
+                        if (!e.currentTarget.src.endsWith(fallback)) {
+                          e.currentTarget.src = fallback;
+                        }
+                      }}
+                      className="w-full h-full object-cover object-top"
+                    />
+                  </div>
 
-                <div
-                  className="hidden sm:flex flex-col items-center gap-3 absolute top-4 right-2 bottom-10"
-                  aria-hidden="true"
-                >
-                  <div className="w-[3px] flex-1 bg-[#4CB04F] rounded-full" />
-                  <div className="w-[3px] h-14 bg-[#4CB04F] rounded-full" />
-                </div>
+                  <div
+                    className="hidden sm:flex flex-col items-center gap-3 absolute top-4 -right-5 bottom-4"
+                    aria-hidden="true"
+                  >
+                    <div className="w-[3px] flex-1 bg-[#4CB04F] rounded-full" />
+                    <div className="w-[3px] h-14 bg-[#4CB04F] rounded-full" />
+                  </div>
 
-                <div className="sm:absolute sm:bottom-0 sm:right-6 mt-4 sm:mt-0 bg-[#1D221F] text-white px-6 sm:px-7 py-5 sm:py-6 rounded-[4px] w-full sm:max-w-[290px] shadow-xl">
-                  <p className="text-[11px] font-semibold tracking-wider text-neutral-300 uppercase mb-1.5">
-                    OUR MISSION
-                  </p>
-                  <p className="text-base sm:text-lg font-extrabold leading-snug tracking-tight">
-                    MAKE SOLAR ENERGY ACCESSIBLE
-                  </p>
+                  <div className="bg-[#1D221F] text-white px-6 py-4 rounded-b-[10px] shadow-md">
+                    <p className="text-[10px] font-semibold tracking-wider text-[#66C969] uppercase mb-1">
+                      OUR MISSION
+                    </p>
+                    <p className="text-sm sm:text-base font-extrabold leading-snug tracking-tight">
+                      MAKE SOLAR ENERGY ACCESSIBLE
+                    </p>
+                  </div>
                 </div>
               </div>
 

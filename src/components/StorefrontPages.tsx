@@ -377,16 +377,28 @@ export const AboutCompanyPage: React.FC<AboutPageProps> = ({
           </div>
 
           <div className="lg:col-span-5 space-y-5">
-            <div className="relative rounded-[8px] overflow-hidden border border-neutral-200 bg-neutral-100 shadow-xs">
-              <img
-                src={
-                  settings.missionImageUrl ||
-                  'https://i.ibb.co/GQdg80PP/leadership-photo.png'
-                }
-                alt={`${settings.storeName} — Make Solar Energy Accessible`}
-                referrerPolicy="no-referrer"
-                className="w-full h-[260px] sm:h-[300px] object-cover object-top"
-              />
+            <div className="relative rounded-[10px] overflow-hidden border border-neutral-200 bg-neutral-100 shadow-xs max-w-[420px] mx-auto lg:mx-0">
+              <div className="aspect-[3/4] w-full bg-[#F3F5F4] overflow-hidden">
+                <img
+                  src={
+                    settings.missionImageUrl &&
+                    !settings.missionImageUrl.includes('i.ibb.co/GQdg80PP/leadership-photo.png')
+                      ? settings.missionImageUrl
+                      : '/src/assets/images/leadership-photo.png'
+                  }
+                  alt={`${settings.storeName} — Make Solar Energy Accessible`}
+                  referrerPolicy="no-referrer"
+                  loading="eager"
+                  decoding="async"
+                  onError={(e) => {
+                    const fallback = '/src/assets/images/leadership-photo.png';
+                    if (!e.currentTarget.src.endsWith(fallback)) {
+                      e.currentTarget.src = fallback;
+                    }
+                  }}
+                  className="w-full h-full object-cover object-top"
+                />
+              </div>
               <div className="bg-[#1D221F] text-white px-5 py-4">
                 <p className="text-[10px] font-semibold tracking-wider text-[#4CB04F] uppercase mb-1">
                   OUR MISSION

@@ -52,6 +52,7 @@ import {
   type TrackingStage,
 } from '../types';
 import { formatNaira } from '../utils/invoicePdf';
+import { parseJsonResponseSafe, prepareMediaForUpload } from '../utils/mediaUpload';
 
 type AdminTab =
   | 'overview'
@@ -74,14 +75,6 @@ const AVAILABLE_IMAGES = [
   { label: 'Portable Power 300W', url: '/src/assets/images/product_portable_station_1795501706387.jpg' },
   { label: 'EcoFlow Delta 1088Wh', url: '/src/assets/images/product_ecoflow_station_1795501705949.jpg' },
 ];
-
-const readFileAsDataUrl = (file: File): Promise<string> =>
-  new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ''));
-    reader.onerror = () => reject(new Error('Failed to read file.'));
-    reader.readAsDataURL(file);
-  });
 
 interface AdminDashboardProps {
   token: string | null;
@@ -315,21 +308,21 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   }, [token, data, loadDashboard]);
 
   const uploadMediaFile = async (file: File): Promise<{ url: string; type: 'image' | 'video' }> => {
-    const dataBase64 = await readFileAsDataUrl(file);
+    const prepared = await prepareMediaForUpload(file);
     const res = await fetch('/api/admin/upload', {
       method: 'POST',
       headers: authHeaders,
       body: JSON.stringify({
-        filename: file.name,
-        mimeType: file.type,
-        dataBase64,
+        filename: prepared.filename,
+        mimeType: prepared.mimeType,
+        dataBase64: prepared.dataBase64,
       }),
     });
-    const json = await res.json();
-    if (!res.ok) {
+    const json = await parseJsonResponseSafe<{ url?: string; type?: 'image' | 'video'; error?: string }>(res);
+    if (!res.ok || !json.url) {
       throw new Error(json.error || 'Upload failed.');
     }
-    return json;
+    return { url: json.url, type: json.type || 'image' };
   };
 
   const openNewProductModal = (opts?: {
@@ -2531,9 +2524,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       <span>Choose Flash Sale Product Image</span>
                       <input
                         type="file"
-                        accept=".jpg,.jpeg,.png,.webp"
+                        accept="image/*"
                         className="hidden"
-                        onChange={(e) => handleProductDropFiles(e.target.files, true)}
+                        onChange={(e) => {
+                          handleProductDropFiles(e.target.files, true);
+                          e.target.value = '';
+                        }}
                       />
                     </label>
                   </div>
@@ -2662,9 +2658,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       <span>Browse Product File</span>
                       <input
                         type="file"
-                        accept=".jpg,.jpeg,.png,.webp,.json"
+                        accept="image/*,.json"
                         className="hidden"
-                        onChange={(e) => handleProductDropFiles(e.target.files, false)}
+                        onChange={(e) => {
+                          handleProductDropFiles(e.target.files, false);
+                          e.target.value = '';
+                        }}
                       />
                     </label>
                   </div>
@@ -2863,9 +2862,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         <span>Choose Image / Video</span>
                         <input
                           type="file"
-                          accept=".jpg,.jpeg,.png,.webp,.mp4,.webm,.mov"
+                          accept="image/*,video/*"
                           className="hidden"
-                          onChange={(e) => handleAboutMediaDropFiles(e.target.files)}
+                          onChange={(e) => {
+                            handleAboutMediaDropFiles(e.target.files);
+                            e.target.value = '';
+                          }}
                         />
                       </label>
                     </div>
@@ -3120,9 +3122,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         <span>Upload New Image</span>
                         <input
                           type="file"
-                          accept=".jpg,.jpeg,.png,.webp"
+                          accept="image/*"
                           className="hidden"
-                          onChange={(e) => handleAfterHeroNewProductDrop(e.target.files)}
+                          onChange={(e) => {
+                            handleAfterHeroNewProductDrop(e.target.files);
+                            e.target.value = '';
+                          }}
                         />
                       </label>
                     </div>
@@ -3175,9 +3180,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                               <span>Upload Image</span>
                               <input
                                 type="file"
-                                accept=".jpg,.jpeg,.png,.webp"
+                                accept="image/*"
                                 className="hidden"
-                                onChange={(e) => handleDirectCardImageDrop(banner, e.target.files)}
+                                onChange={(e) => {
+                                  handleDirectCardImageDrop(banner, e.target.files);
+                                  e.target.value = '';
+                                }}
                               />
                             </label>
                             <button
@@ -4485,9 +4493,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 <span>Upload</span>
                 <input
                   type="file"
-                  accept=".jpg,.jpeg,.png,.webp"
+                  accept="image/*"
                   className="hidden"
-                  onChange={(e) => handleBannerImageDrop(e.target.files)}
+                  onChange={(e) => {
+                    handleBannerImageDrop(e.target.files);
+                    e.target.value = '';
+                  }}
                 />
               </label>
             </div>
@@ -4747,9 +4758,12 @@ const ProductEditorModal: React.FC<ProductEditorModalProps> = ({
             <span>Upload</span>
             <input
               type="file"
-              accept=".jpg,.jpeg,.png,.webp"
+              accept="image/*"
               className="hidden"
-              onChange={(e) => handleImageDrop(e.target.files)}
+              onChange={(e) => {
+                handleImageDrop(e.target.files);
+                e.target.value = '';
+              }}
             />
           </label>
         </div>

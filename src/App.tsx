@@ -78,14 +78,42 @@ function AppContent() {
   const [cartNotice, setCartNotice] = useState<string | null>(null);
 
   const fetchStorefront = useCallback(async () => {
+    const attemptFetch = async (): Promise<StorefrontData> => {
+      const res = await fetch('/api/storefront', {
+        headers: { Accept: 'application/json' },
+      });
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok) {
+        let errMessage = 'Unable to connect to Emmystylez Solar Electrical Store server.';
+        if (contentType.includes('application/json')) {
+          const errJson = await res.json().catch(() => null);
+          if (errJson?.error) errMessage = errJson.error;
+        }
+        throw new Error(errMessage);
+      }
+      if (!contentType.includes('application/json')) {
+        throw new Error('Server API returned non-JSON response. Please check API function routing.');
+      }
+      return (await res.json()) as StorefrontData;
+    };
+
     try {
-      const res = await fetch('/api/storefront');
-      if (!res.ok) throw new Error('Failed to load storefront.');
-      const json: StorefrontData = await res.json();
+      setLoadError(null);
+      let json: StorefrontData;
+      try {
+        json = await attemptFetch();
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 900));
+        json = await attemptFetch();
+      }
       setStorefrontData(json);
       setLoadError(null);
-    } catch {
-      setLoadError('Unable to connect to Emmystylez Solar Electrical Store server.');
+    } catch (err) {
+      setLoadError(
+        err instanceof Error && err.message
+          ? err.message
+          : 'Unable to connect to Emmystylez Solar Electrical Store server.'
+      );
     } finally {
       setLoading(false);
     }

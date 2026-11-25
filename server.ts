@@ -4,7 +4,6 @@ import express, { NextFunction, Request, Response } from 'express';
 import fs from 'fs';
 import path from 'path';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
-import { createServer as createViteServer } from 'vite';
 import type {
   AboutMediaItem,
   AdminDashboardData,
@@ -51,14 +50,27 @@ interface StoreDatabase {
 }
 
 const SCHEMA_VERSION = 5;
-const DATA_DIR = path.resolve(process.cwd(), '.data');
+const IS_SERVERLESS = Boolean(
+  process.env.NETLIFY || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.LAMBDA_TASK_ROOT
+);
+const DATA_DIR = IS_SERVERLESS
+  ? path.join('/tmp', 'emmystylez-data')
+  : path.resolve(process.cwd(), '.data');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const RECEIPTS_DIR = path.join(UPLOADS_DIR, 'receipts');
 const DB_FILE = path.join(DATA_DIR, 'emmystylez-store.json');
-const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+const SESSION_SECRET =
+  process.env.SESSION_SECRET?.trim() ||
+  crypto
+    .createHash('sha256')
+    .update(
+      `emmystylez-session:${process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.ADMIN_PASSCODE || 'global-fallback-key'}`
+    )
+    .digest('hex');
 
 const adminSessions = new Map<string, number>();
 const customerSessions = new Map<string, { customerId: string; expiresAt: number }>();
+const revokedTokens = new Map<string, number>();
 
 interface LoginAttemptRecord {
   failures: number;
@@ -598,7 +610,7 @@ const createInitialDatabase = (
     flashSalesHeading: 'Flash Sales Deals',
     flashSalesSubheading: 'Limited-time factory pricing on high-demand solar panels, hybrid inverters & batteries',
     heroImageUrl: 'https://i.ibb.co/5hvHYxLt/IMG-20261120-WA0081.jpg',
-    missionImageUrl: 'https://i.ibb.co/GQdg80PP/leadership-photo.png',
+    missionImageUrl: '/src/assets/images/leadership-photo.png',
     bankDetails: {
       bankName: 'UBA BANK',
       accountName: 'Emmystylez',
@@ -686,13 +698,28 @@ const uploadBufferToSupabaseStorage = async (
 ): Promise<string | null> => {
   if (!supabaseClient) return null;
   try {
-    const { error } = await supabaseClient.storage
+    let { error } = await supabaseClient.storage
       .from('emmystylez-media')
       .upload(storagePath, buffer, { contentType, upsert: true });
-    if (error) return null;
+
+    if (error && /bucket/i.test(error.message || '')) {
+      await supabaseClient.storage
+        .createBucket('emmystylez-media', { public: true })
+        .catch(() => {});
+      const retry = await supabaseClient.storage
+        .from('emmystylez-media')
+        .upload(storagePath, buffer, { contentType, upsert: true });
+      error = retry.error;
+    }
+
+    if (error) {
+      console.error('Supabase storage upload error:', error.message);
+      return null;
+    }
     const { data } = supabaseClient.storage.from('emmystylez-media').getPublicUrl(storagePath);
     return data?.publicUrl || null;
-  } catch {
+  } catch (err) {
+    console.error('Supabase storage upload exception:', err);
     return null;
   }
 };
@@ -1016,28 +1043,45 @@ const syncToSupabase = async (snapshot: StoreDatabase): Promise<void> => {
   }
 };
 
+let lastHydratedAt = 0;
+let hydrationInFlight: Promise<void> | null = null;
+
 const writeLocalDatabaseFile = (database: StoreDatabase): void => {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  const serialized = JSON.stringify(database, null, 2);
-  const tmpFile = `${DB_FILE}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmpFile, serialized, 'utf-8');
-  if (fs.existsSync(DB_FILE)) {
-    try {
-      fs.copyFileSync(DB_FILE, DB_BACKUP_FILE);
-    } catch {
-      // Non-fatal backup copy skip
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    const serialized = JSON.stringify(database, null, 2);
+    const tmpFile = `${DB_FILE}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmpFile, serialized, 'utf-8');
+    if (fs.existsSync(DB_FILE)) {
+      try {
+        fs.copyFileSync(DB_FILE, DB_BACKUP_FILE);
+      } catch {
+        // Non-fatal backup copy skip
+      }
+    }
+    fs.renameSync(tmpFile, DB_FILE);
+  } catch (err) {
+    if (!IS_SERVERLESS) {
+      console.warn('Local DB write notice:', err instanceof Error ? err.message : err);
     }
   }
-  fs.renameSync(tmpFile, DB_FILE);
 };
 
 const saveDatabase = (database: StoreDatabase): void => {
+  lastHydratedAt = Date.now();
   writeLocalDatabaseFile(database);
   if (supabaseClient) {
     const snapshot = JSON.parse(JSON.stringify(database)) as StoreDatabase;
     supabaseSyncQueue = supabaseSyncQueue.then(() => syncToSupabase(snapshot));
+  }
+};
+
+const saveDatabaseAsync = async (database: StoreDatabase): Promise<void> => {
+  saveDatabase(database);
+  if (supabaseClient) {
+    await supabaseSyncQueue;
   }
 };
 
@@ -1061,16 +1105,30 @@ const hydrateFromSupabase = async (): Promise<void> => {
       const remoteDb = data.state as StoreDatabase;
       if (Array.isArray(remoteDb.products) && remoteDb.settings) {
         db = remoteDb;
+        if (!db.customers) db.customers = [];
+        if (!db.aboutMedia) db.aboutMedia = [];
+        if (!db.orders) db.orders = [];
+        if (!db.transactions) db.transactions = [];
+        if (!db.inquiries) db.inquiries = [];
+        if (!db.banners) db.banners = [];
+        if (!db.coupons) db.coupons = [];
+        if (
+          !db.settings.missionImageUrl ||
+          db.settings.missionImageUrl.includes('i.ibb.co/GQdg80PP/leadership-photo.png')
+        ) {
+          db.settings.missionImageUrl = '/src/assets/images/leadership-photo.png';
+        }
         writeLocalDatabaseFile(db);
+        lastHydratedAt = Date.now();
         supabaseStatus.connected = true;
         supabaseStatus.lastSyncAt = data.updated_at || new Date().toISOString();
         supabaseStatus.lastError = null;
-        console.log('Hydrated Emmystylez store database from Supabase globally.');
         return;
       }
     }
 
     await syncToSupabase(db);
+    lastHydratedAt = Date.now();
     if (supabaseStatus.connected) {
       console.log('Seeded initial Emmystylez store data into Supabase globally.');
     }
@@ -1078,6 +1136,20 @@ const hydrateFromSupabase = async (): Promise<void> => {
     supabaseStatus.connected = false;
     supabaseStatus.lastError = err instanceof Error ? err.message : 'Supabase connection error';
   }
+};
+
+const ensureLatestState = async (force = false): Promise<void> => {
+  if (!supabaseClient) return;
+  const maxAgeMs = IS_SERVERLESS ? 1500 : 60_000;
+  if (!force && lastHydratedAt > 0 && Date.now() - lastHydratedAt < maxAgeMs) {
+    return;
+  }
+  if (!hydrationInFlight) {
+    hydrationInFlight = hydrateFromSupabase().finally(() => {
+      hydrationInFlight = null;
+    });
+  }
+  await hydrationInFlight;
 };
 
 const loadDatabase = (): StoreDatabase => {
@@ -1113,7 +1185,10 @@ const loadDatabase = (): StoreDatabase => {
         heroImageUrl:
           parsed.settings.heroImageUrl || 'https://i.ibb.co/5hvHYxLt/IMG-20261120-WA0081.jpg',
         missionImageUrl:
-          parsed.settings.missionImageUrl || 'https://i.ibb.co/GQdg80PP/leadership-photo.png',
+          parsed.settings.missionImageUrl &&
+          !parsed.settings.missionImageUrl.includes('i.ibb.co/GQdg80PP/leadership-photo.png')
+            ? parsed.settings.missionImageUrl
+            : '/src/assets/images/leadership-photo.png',
         bankDetails: shouldUpdateBank1
           ? {
               bankName: 'UBA BANK',
@@ -1153,8 +1228,11 @@ const loadDatabase = (): StoreDatabase => {
     if (!parsed.settings.heroImageUrl) {
       parsed.settings.heroImageUrl = 'https://i.ibb.co/5hvHYxLt/IMG-20261120-WA0081.jpg';
     }
-    if (!parsed.settings.missionImageUrl) {
-      parsed.settings.missionImageUrl = 'https://i.ibb.co/GQdg80PP/leadership-photo.png';
+    if (
+      !parsed.settings.missionImageUrl ||
+      parsed.settings.missionImageUrl.includes('i.ibb.co/GQdg80PP/leadership-photo.png')
+    ) {
+      parsed.settings.missionImageUrl = '/src/assets/images/leadership-photo.png';
     }
     if (!parsed.settings.secondaryBankDetails) {
       parsed.settings.secondaryBankDetails = {
@@ -1209,53 +1287,77 @@ const verifyEnvPasscode = (input: string, envValue: string): boolean => {
   return crypto.timingSafeEqual(a, b);
 };
 
-const signToken = (prefix: string): string => {
-  const raw = `${prefix}_${crypto.randomBytes(24).toString('hex')}`;
-  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(raw).digest('hex');
+interface SignedSessionPayload {
+  r: 'adm' | 'cus';
+  s?: string;
+  e: number;
+  n: string;
+}
+
+const signSessionPayload = (payload: SignedSessionPayload): string => {
+  const encoded = Buffer.from(JSON.stringify(payload), 'utf-8').toString('base64url');
+  const raw = `${payload.r}_${encoded}`;
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(raw).digest('base64url');
   return `${raw}.${sig}`;
 };
 
-const verifyTokenSignature = (token: string): boolean => {
+const verifySignedSessionPayload = (token: string): SignedSessionPayload | null => {
+  if (!token || revokedTokens.has(token)) return null;
   const parts = token.split('.');
-  if (parts.length !== 2) return false;
+  if (parts.length !== 2) return null;
   const [raw, sig] = parts;
-  const expectedSig = crypto.createHmac('sha256', SESSION_SECRET).update(raw).digest('hex');
+  const expectedSig = crypto.createHmac('sha256', SESSION_SECRET).update(raw).digest('base64url');
   const a = Buffer.from(sig, 'utf-8');
   const b = Buffer.from(expectedSig, 'utf-8');
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(a, b);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+
+  const sepIdx = raw.indexOf('_');
+  if (sepIdx === -1) return null;
+  try {
+    const decoded = JSON.parse(
+      Buffer.from(raw.slice(sepIdx + 1), 'base64url').toString('utf-8')
+    ) as SignedSessionPayload;
+    if (!decoded || typeof decoded.e !== 'number' || decoded.e < Date.now()) {
+      return null;
+    }
+    return decoded;
+  } catch {
+    return null;
+  }
 };
 
 const issueAdminSessionToken = (): string => {
-  const token = signToken('adm');
-  adminSessions.set(token, Date.now() + 24 * 60 * 60 * 1000);
+  const expiresAt = Date.now() + 24 * 60 * 60 * 1000;
+  const token = signSessionPayload({
+    r: 'adm',
+    e: expiresAt,
+    n: crypto.randomBytes(12).toString('hex'),
+  });
+  adminSessions.set(token, expiresAt);
   return token;
 };
 
 const verifyAdminSessionToken = (token: string): boolean => {
-  if (!verifyTokenSignature(token)) return false;
-  const expiresAt = adminSessions.get(token);
-  if (!expiresAt || expiresAt < Date.now()) {
-    adminSessions.delete(token);
-    return false;
-  }
-  return true;
+  const payload = verifySignedSessionPayload(token);
+  return Boolean(payload && payload.r === 'adm');
 };
 
 const issueCustomerSessionToken = (customerId: string): string => {
-  const token = signToken('cus');
-  customerSessions.set(token, { customerId, expiresAt: Date.now() + 24 * 60 * 60 * 1000 });
+  const expiresAt = Date.now() + 24 * 60 * 60 * 1000;
+  const token = signSessionPayload({
+    r: 'cus',
+    s: customerId,
+    e: expiresAt,
+    n: crypto.randomBytes(12).toString('hex'),
+  });
+  customerSessions.set(token, { customerId, expiresAt });
   return token;
 };
 
 const verifyCustomerSessionToken = (token: string): string | null => {
-  if (!verifyTokenSignature(token)) return null;
-  const session = customerSessions.get(token);
-  if (!session || session.expiresAt < Date.now()) {
-    customerSessions.delete(token);
-    return null;
-  }
-  return session.customerId;
+  const payload = verifySignedSessionPayload(token);
+  if (!payload || payload.r !== 'cus' || !payload.s) return null;
+  return payload.s;
 };
 
 const requireAdmin = (req: Request, res: Response, next: NextFunction) => {
@@ -1533,6 +1635,9 @@ setInterval(() => {
   for (const [tok, sess] of customerSessions.entries()) {
     if (now > sess.expiresAt) customerSessions.delete(tok);
   }
+  for (const [tok, exp] of revokedTokens.entries()) {
+    if (now > exp) revokedTokens.delete(tok);
+  }
   for (const [key, rec] of adminLoginAttempts.entries()) {
     if (rec.lockedUntil > 0 && now > rec.lockedUntil + 60_000) adminLoginAttempts.delete(key);
   }
@@ -1541,11 +1646,28 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000).unref();
 
-async function startServer() {
-  await hydrateFromSupabase();
+export function createApiApp(options?: { includeErrorHandler?: boolean }) {
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', 1);
+
+  // Normalize Netlify Serverless Function paths (/.netlify/functions/api/* -> /api/* or /uploads/*)
+  app.use((req, _res, next) => {
+    if (req.url.startsWith('/.netlify/functions/api')) {
+      const stripped = req.url.slice('/.netlify/functions/api'.length) || '/';
+      req.url =
+        stripped.startsWith('/api') || stripped.startsWith('/uploads')
+          ? stripped
+          : `/api${stripped.startsWith('/') ? '' : '/'}${stripped}`;
+    } else if (
+      IS_SERVERLESS &&
+      !req.url.startsWith('/api') &&
+      !req.url.startsWith('/uploads')
+    ) {
+      req.url = `/api${req.url.startsWith('/') ? '' : '/'}${req.url}`;
+    }
+    next();
+  });
 
   // Security headers compatible with iframe preview & standard web browsers
   app.use((_req, res, next) => {
@@ -1556,6 +1678,14 @@ async function startServer() {
   });
 
   app.use(express.json({ limit: '25mb' }));
+
+  // Ensure global Supabase hydration before serving /api routes
+  app.use('/api', async (req, _res, next) => {
+    if (req.path !== '/health') {
+      await ensureLatestState();
+    }
+    next();
+  });
 
   const authRateLimiter = createRateLimiter(
     25,
@@ -1613,7 +1743,7 @@ async function startServer() {
   });
 
   // ---------------- CUSTOMER ACCOUNT AUTH & FORGOT PASSWORD ----------------
-  app.post('/api/auth/register', authRateLimiter, (req, res) => {
+  app.post('/api/auth/register', authRateLimiter, async (req, res) => {
     const fullName = String(req.body?.fullName || '').trim();
     const email = String(req.body?.email || '').trim().toLowerCase();
     const phone = String(req.body?.phone || '').trim();
@@ -1667,7 +1797,7 @@ async function startServer() {
     };
 
     db.customers.unshift(newCustomer);
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
 
     const token = issueCustomerSessionToken(newCustomer.id);
     res.status(201).json({
@@ -1775,11 +1905,14 @@ async function startServer() {
   app.post('/api/auth/logout', (req, res) => {
     const authHeader = req.headers.authorization || '';
     const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-    customerSessions.delete(token);
+    if (token) {
+      customerSessions.delete(token);
+      revokedTokens.set(token, Date.now() + 24 * 60 * 60 * 1000);
+    }
     res.json({ ok: true });
   });
 
-  app.post('/api/auth/forgot-password', authRateLimiter, (req, res) => {
+  app.post('/api/auth/forgot-password', authRateLimiter, async (req, res) => {
     syncExpiredResetCodes();
 
     const email = String(req.body?.email || '').trim().toLowerCase();
@@ -1857,7 +1990,7 @@ async function startServer() {
       });
     }
 
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
 
     res.json({
       ok: true,
@@ -1868,7 +2001,7 @@ async function startServer() {
     });
   });
 
-  app.post('/api/auth/reset-password', authRateLimiter, (req, res) => {
+  app.post('/api/auth/reset-password', authRateLimiter, async (req, res) => {
     const expiredNow = syncExpiredResetCodes();
 
     const email = String(req.body?.email || '').trim().toLowerCase();
@@ -1927,7 +2060,7 @@ async function startServer() {
     customer.resetCodeStatus = 'Used';
     customer.activeResetCode = null;
     customer.resetCodeExpiresAt = null;
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
 
     const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
     customerLoginAttempts.delete(`${clientIp}:${customer.email.toLowerCase()}`);
@@ -1995,6 +2128,17 @@ async function startServer() {
     );
     if (cloudUrl) {
       res.status(201).json({ url: cloudUrl });
+      return;
+    }
+
+    if (IS_SERVERLESS) {
+      if (mime.startsWith('image/') && buffer.length <= 1.5 * 1024 * 1024) {
+        res.status(201).json({ url: `data:${mime};base64,${buffer.toString('base64')}` });
+        return;
+      }
+      res.status(503).json({
+        error: 'Cloud media storage is unavailable. Please verify SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY or upload a smaller receipt image.',
+      });
       return;
     }
 
@@ -2258,7 +2402,7 @@ async function startServer() {
 
     db.orders.unshift(newOrder);
     db.transactions.unshift(newTransaction);
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
 
     res.status(201).json({ order: newOrder, transaction: newTransaction });
   });
@@ -2294,7 +2438,7 @@ async function startServer() {
   });
 
   // Public Service / Installation / Wholesale Quote Inquiry
-  app.post('/api/inquiries', publicWriteLimiter, (req, res) => {
+  app.post('/api/inquiries', publicWriteLimiter, async (req, res) => {
     const name = String(req.body?.name || '').trim();
     const email = String(req.body?.email || '').trim();
     const phone = String(req.body?.phone || '').trim();
@@ -2324,7 +2468,7 @@ async function startServer() {
     };
 
     db.inquiries.unshift(inquiry);
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.status(201).json({ inquiry });
   });
 
@@ -2335,7 +2479,7 @@ async function startServer() {
     res.json({ initialized, envManaged });
   });
 
-  app.post('/api/admin/auth/setup', authRateLimiter, (req, res) => {
+  app.post('/api/admin/auth/setup', authRateLimiter, async (req, res) => {
     const envPasscode = process.env.ADMIN_PASSCODE?.trim();
     if (envPasscode || db.adminAuthHash) {
       res.status(409).json({ error: 'Admin passcode is already initialized. Please sign in.' });
@@ -2347,7 +2491,7 @@ async function startServer() {
       return;
     }
     db.adminAuthHash = hashSecret(passcode);
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.status(201).json({ token: issueAdminSessionToken() });
   });
 
@@ -2432,11 +2576,14 @@ async function startServer() {
 
   app.post('/api/admin/auth/logout', requireAdmin, (req, res) => {
     const token = (req.headers.authorization || '').slice(7).trim();
-    adminSessions.delete(token);
+    if (token) {
+      adminSessions.delete(token);
+      revokedTokens.set(token, Date.now() + 24 * 60 * 60 * 1000);
+    }
     res.json({ ok: true });
   });
 
-  app.post('/api/admin/auth/change-passcode', requireAdmin, (req, res) => {
+  app.post('/api/admin/auth/change-passcode', requireAdmin, async (req, res) => {
     if (process.env.ADMIN_PASSCODE?.trim()) {
       res.status(400).json({
         error: 'Admin passcode is managed by environment secret ADMIN_PASSCODE.',
@@ -2454,7 +2601,7 @@ async function startServer() {
       return;
     }
     db.adminAuthHash = hashSecret(newPasscode);
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.json({ ok: true });
   });
 
@@ -2531,6 +2678,20 @@ async function startServer() {
       return;
     }
 
+    if (IS_SERVERLESS) {
+      if (mime.startsWith('image/') && buffer.length <= 1.5 * 1024 * 1024) {
+        res.status(201).json({
+          url: `data:${mime};base64,${buffer.toString('base64')}`,
+          type: mediaType,
+        });
+        return;
+      }
+      res.status(503).json({
+        error: 'Cloud storage upload failed. Check SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY or use a smaller image.',
+      });
+      return;
+    }
+
     if (!fs.existsSync(UPLOADS_DIR)) {
       fs.mkdirSync(UPLOADS_DIR, { recursive: true });
     }
@@ -2546,7 +2707,7 @@ async function startServer() {
   });
 
   // Bulk Product Drag-and-Drop JSON Import
-  app.post('/api/admin/products/bulk', requireAdmin, (req, res) => {
+  app.post('/api/admin/products/bulk', requireAdmin, async (req, res) => {
     const items = req.body?.products;
     if (!Array.isArray(items) || items.length === 0) {
       res.status(400).json({ error: 'No valid products found in import payload.' });
@@ -2559,9 +2720,12 @@ async function startServer() {
       const price = Number(raw?.price);
       if (!name || !Number.isFinite(price) || price <= 0) continue;
 
-      const image = isValidMediaUrl(String(raw?.image || ''))
+      let image = isValidMediaUrl(String(raw?.image || ''))
         ? String(raw.image).trim()
         : '/src/assets/images/product_solar_panels_1795501702594.jpg';
+      if (image.startsWith('data:image/')) {
+        image = await ensureUploadedMediaUrl(image, 'products');
+      }
 
       const stock = Math.max(0, Math.floor(Number(raw?.stock ?? 15)));
       const product: Product = {
@@ -2587,7 +2751,7 @@ async function startServer() {
       added.push(product);
     }
 
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.status(201).json({ importedCount: added.length, products: added });
   });
 
@@ -2639,7 +2803,7 @@ async function startServer() {
     };
 
     db.products.unshift(product);
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.status(201).json({ product });
   });
 
@@ -2687,24 +2851,27 @@ async function startServer() {
       product.flashSalePrice =
         Number(body.flashSalePrice) > 0 ? Number(Number(body.flashSalePrice).toFixed(2)) : undefined;
     }
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.json({ product });
   });
 
-  app.delete('/api/admin/products/:id', requireAdmin, (req, res) => {
+  app.delete('/api/admin/products/:id', requireAdmin, async (req, res) => {
     const idx = db.products.findIndex((p) => p.id === req.params.id);
     if (idx === -1) {
       res.status(404).json({ error: 'Product not found.' });
       return;
     }
     db.products.splice(idx, 1);
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.json({ ok: true });
   });
 
   // Gallery Page Media CRUD (Images & Videos with Specifications posted from Admin Panel)
-  app.post('/api/admin/about-media', requireAdmin, (req, res) => {
-    const url = String(req.body?.url || '').trim();
+  app.post('/api/admin/about-media', requireAdmin, async (req, res) => {
+    let url = String(req.body?.url || '').trim();
+    if (url.startsWith('data:image/')) {
+      url = await ensureUploadedMediaUrl(url, 'gallery');
+    }
     const title = String(req.body?.title || '').trim();
     const caption = String(req.body?.caption || '').trim();
     const specifications = String(req.body?.specifications || '').trim();
@@ -2731,11 +2898,11 @@ async function startServer() {
       createdAt: new Date().toISOString(),
     };
     db.aboutMedia.unshift(item);
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.status(201).json({ item });
   });
 
-  app.patch('/api/admin/about-media/:id', requireAdmin, (req, res) => {
+  app.patch('/api/admin/about-media/:id', requireAdmin, async (req, res) => {
     const item = db.aboutMedia.find((m) => m.id === req.params.id);
     if (!item) {
       res.status(404).json({ error: 'Gallery item not found.' });
@@ -2749,26 +2916,32 @@ async function startServer() {
     }
     if (req.body?.category !== undefined) item.category = req.body.category;
     if (req.body?.type !== undefined) item.type = req.body.type === 'video' ? 'video' : 'image';
-    if (req.body?.url !== undefined && isValidMediaUrl(String(req.body.url))) {
-      item.url = String(req.body.url).trim();
+    if (req.body?.url !== undefined) {
+      let nextUrl = String(req.body.url).trim();
+      if (nextUrl.startsWith('data:image/')) {
+        nextUrl = await ensureUploadedMediaUrl(nextUrl, 'gallery');
+      }
+      if (isValidMediaUrl(nextUrl)) {
+        item.url = nextUrl;
+      }
     }
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.json({ item });
   });
 
-  app.delete('/api/admin/about-media/:id', requireAdmin, (req, res) => {
+  app.delete('/api/admin/about-media/:id', requireAdmin, async (req, res) => {
     const idx = db.aboutMedia.findIndex((m) => m.id === req.params.id);
     if (idx === -1) {
       res.status(404).json({ error: 'Gallery item not found.' });
       return;
     }
     db.aboutMedia.splice(idx, 1);
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.json({ ok: true });
   });
 
   // Orders, Payment Verification & Full Tracking Functions Update
-  app.patch('/api/admin/orders/:id', requireAdmin, (req, res) => {
+  app.patch('/api/admin/orders/:id', requireAdmin, async (req, res) => {
     const order = db.orders.find((o) => o.id === req.params.id);
     if (!order) {
       res.status(404).json({ error: 'Order not found.' });
@@ -2838,11 +3011,11 @@ async function startServer() {
     }
 
     order.updatedAt = new Date().toISOString();
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.json({ order });
   });
 
-  app.delete('/api/admin/orders/:id', requireAdmin, (req, res) => {
+  app.delete('/api/admin/orders/:id', requireAdmin, async (req, res) => {
     const idx = db.orders.findIndex((o) => o.id === req.params.id);
     if (idx === -1) {
       res.status(404).json({ error: 'Order not found.' });
@@ -2851,23 +3024,23 @@ async function startServer() {
     const orderId = db.orders[idx].id;
     db.orders.splice(idx, 1);
     db.transactions = db.transactions.filter((t) => t.orderId !== orderId);
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.json({ ok: true });
   });
 
-  app.delete('/api/admin/customers/:id', requireAdmin, (req, res) => {
+  app.delete('/api/admin/customers/:id', requireAdmin, async (req, res) => {
     const idx = db.customers.findIndex((c) => c.id === req.params.id);
     if (idx === -1) {
       res.status(404).json({ error: 'Customer account not found.' });
       return;
     }
     db.customers.splice(idx, 1);
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.json({ ok: true });
   });
 
   // Admin manual regeneration of EXP code for a customer
-  app.post('/api/admin/customers/:id/regenerate-code', requireAdmin, (req, res) => {
+  app.post('/api/admin/customers/:id/regenerate-code', requireAdmin, async (req, res) => {
     const customer = db.customers.find((c) => c.id === req.params.id);
     if (!customer) {
       res.status(404).json({ error: 'Customer account not found.' });
@@ -2885,13 +3058,13 @@ async function startServer() {
       issuedAt: new Date(now).toISOString(),
       expiresAt: expiresAtIso,
     });
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     const { passwordHash: _ph, ...safeCustomer } = customer;
     res.json({ customer: safeCustomer });
   });
 
   // Payment Gateways Configuration
-  app.put('/api/admin/gateways', requireAdmin, (req, res) => {
+  app.put('/api/admin/gateways', requireAdmin, async (req, res) => {
     const incoming = req.body?.gateways;
     if (!Array.isArray(incoming)) {
       res.status(400).json({ error: 'Gateways array required.' });
@@ -2910,16 +3083,19 @@ async function startServer() {
         target.instructions = String(item.instructions || target.instructions).slice(0, 300);
       }
     }
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.json({ gateways: db.gateways });
   });
 
   // Promo Banners CRUD (After-Hero Product & Promo Cards)
-  app.post('/api/admin/banners', requireAdmin, (req, res) => {
+  app.post('/api/admin/banners', requireAdmin, async (req, res) => {
     const body = req.body ?? {};
     const title = String(body.title || '').trim();
     const badgeText = String(body.badgeText || 'New Arrival').trim();
-    const image = String(body.image || '').trim();
+    let image = String(body.image || '').trim();
+    if (image.startsWith('data:image/')) {
+      image = await ensureUploadedMediaUrl(image, 'banners');
+    }
     const productId = String(body.productId || db.products[0]?.id || '').trim();
     if (!title || !isValidMediaUrl(image)) {
       res.status(400).json({ error: 'Card title and a valid image are required.' });
@@ -2936,11 +3112,11 @@ async function startServer() {
       active: body.active !== undefined ? Boolean(body.active) : true,
     };
     db.banners.unshift(newBanner);
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.status(201).json({ banner: newBanner });
   });
 
-  app.put('/api/admin/banners/:id', requireAdmin, (req, res) => {
+  app.put('/api/admin/banners/:id', requireAdmin, async (req, res) => {
     const banner = db.banners.find((b) => b.id === req.params.id);
     if (!banner) {
       res.status(404).json({ error: 'Banner not found.' });
@@ -2953,28 +3129,34 @@ async function startServer() {
     }
     if (body.title !== undefined) banner.title = String(body.title).trim();
     if (body.productId !== undefined) banner.productId = String(body.productId).trim();
-    if (body.image !== undefined && isValidMediaUrl(String(body.image))) {
-      banner.image = String(body.image).trim();
+    if (body.image !== undefined) {
+      let nextImage = String(body.image).trim();
+      if (nextImage.startsWith('data:image/')) {
+        nextImage = await ensureUploadedMediaUrl(nextImage, 'banners');
+      }
+      if (isValidMediaUrl(nextImage)) {
+        banner.image = nextImage;
+      }
     }
     if (body.ctaLabel !== undefined) banner.ctaLabel = String(body.ctaLabel).trim();
     if (body.active !== undefined) banner.active = Boolean(body.active);
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.json({ banner });
   });
 
-  app.delete('/api/admin/banners/:id', requireAdmin, (req, res) => {
+  app.delete('/api/admin/banners/:id', requireAdmin, async (req, res) => {
     const idx = db.banners.findIndex((b) => b.id === req.params.id);
     if (idx === -1) {
       res.status(404).json({ error: 'Banner not found.' });
       return;
     }
     const [removed] = db.banners.splice(idx, 1);
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.json({ ok: true, removedId: removed.id });
   });
 
   // Coupons CRUD
-  app.post('/api/admin/coupons', requireAdmin, (req, res) => {
+  app.post('/api/admin/coupons', requireAdmin, async (req, res) => {
     const code = String(req.body?.code || '').trim().toUpperCase();
     const type = req.body?.type === 'fixed' ? 'fixed' : 'percent';
     const value = Number(req.body?.value || 0);
@@ -2999,35 +3181,44 @@ async function startServer() {
       active: true,
     };
     db.coupons.unshift(coupon);
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.status(201).json({ coupon });
   });
 
-  app.patch('/api/admin/coupons/:id', requireAdmin, (req, res) => {
+  app.patch('/api/admin/coupons/:id', requireAdmin, async (req, res) => {
     const coupon = db.coupons.find((c) => c.id === req.params.id);
     if (!coupon) {
       res.status(404).json({ error: 'Coupon not found.' });
       return;
     }
     if (req.body?.active !== undefined) coupon.active = Boolean(req.body.active);
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.json({ coupon });
   });
 
-  app.delete('/api/admin/coupons/:id', requireAdmin, (req, res) => {
+  app.delete('/api/admin/coupons/:id', requireAdmin, async (req, res) => {
     const idx = db.coupons.findIndex((c) => c.id === req.params.id);
     if (idx === -1) {
       res.status(404).json({ error: 'Coupon not found.' });
       return;
     }
     db.coupons.splice(idx, 1);
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.json({ ok: true });
   });
 
   // Storefront Settings (Global WhatsApp, Delivery Fee, Bank Account, Flash Sales Titles)
-  app.put('/api/admin/settings', requireAdmin, (req, res) => {
+  app.put('/api/admin/settings', requireAdmin, async (req, res) => {
     const body = req.body ?? {};
+    let heroUrl = body.heroImageUrl ? String(body.heroImageUrl).trim() : '';
+    if (heroUrl.startsWith('data:image/')) {
+      heroUrl = await ensureUploadedMediaUrl(heroUrl, 'settings');
+    }
+    let missionUrl = body.missionImageUrl ? String(body.missionImageUrl).trim() : '';
+    if (missionUrl.startsWith('data:image/')) {
+      missionUrl = await ensureUploadedMediaUrl(missionUrl, 'settings');
+    }
+
     db.settings = {
       ...db.settings,
       storeName: String(body.storeName ?? db.settings.storeName).slice(0, 100),
@@ -3055,13 +3246,13 @@ async function startServer() {
         0
       ),
       heroImageUrl:
-        body.heroImageUrl && isValidMediaUrl(String(body.heroImageUrl))
-          ? String(body.heroImageUrl).trim().slice(0, 400)
+        heroUrl && isValidMediaUrl(heroUrl)
+          ? heroUrl.startsWith('data:') ? heroUrl : heroUrl.slice(0, 1000)
           : db.settings.heroImageUrl || 'https://i.ibb.co/5hvHYxLt/IMG-20261120-WA0081.jpg',
       missionImageUrl:
-        body.missionImageUrl && isValidMediaUrl(String(body.missionImageUrl))
-          ? String(body.missionImageUrl).trim().slice(0, 400)
-          : db.settings.missionImageUrl || 'https://i.ibb.co/GQdg80PP/leadership-photo.png',
+        missionUrl && isValidMediaUrl(missionUrl)
+          ? missionUrl.startsWith('data:') ? missionUrl : missionUrl.slice(0, 1000)
+          : db.settings.missionImageUrl || '/src/assets/images/leadership-photo.png',
       bankDetails: {
         bankName: String(body.bankDetails?.bankName ?? db.settings.bankDetails.bankName).slice(0, 120),
         accountName: String(
@@ -3101,30 +3292,30 @@ async function startServer() {
         ).slice(0, 40),
       },
     };
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.json({ settings: db.settings });
   });
 
   // Inquiries Status Update & Delete
-  app.patch('/api/admin/inquiries/:id', requireAdmin, (req, res) => {
+  app.patch('/api/admin/inquiries/:id', requireAdmin, async (req, res) => {
     const inquiry = db.inquiries.find((i) => i.id === req.params.id);
     if (!inquiry) {
       res.status(404).json({ error: 'Inquiry not found.' });
       return;
     }
     if (req.body?.status) inquiry.status = req.body.status;
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.json({ inquiry });
   });
 
-  app.delete('/api/admin/inquiries/:id', requireAdmin, (req, res) => {
+  app.delete('/api/admin/inquiries/:id', requireAdmin, async (req, res) => {
     const idx = db.inquiries.findIndex((i) => i.id === req.params.id);
     if (idx === -1) {
       res.status(404).json({ error: 'Inquiry not found.' });
       return;
     }
     db.inquiries.splice(idx, 1);
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.json({ ok: true });
   });
 
@@ -3153,7 +3344,7 @@ async function startServer() {
   });
 
   // Clear Store Records (Sales, Orders, Inquiries, Customer Accounts, Transactions) — Keeps Products Intact
-  app.post('/api/admin/reset-data', requireAdmin, (req, res) => {
+  app.post('/api/admin/reset-data', requireAdmin, async (req, res) => {
     const clearProducts = Boolean(req.body?.clearProducts);
     if (clearProducts) {
       db.products = [];
@@ -3168,7 +3359,7 @@ async function startServer() {
     db.nextTrackingNumber = 1001;
     db.nextEmmyCodeNumber = 1001;
     db.nextExpCodeNumber = 1001;
-    saveDatabase(db);
+    await saveDatabaseAsync(db);
     res.json({
       ok: true,
       message: clearProducts
@@ -3177,22 +3368,14 @@ async function startServer() {
     });
   });
 
-  // Vite / Static Serving
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distDir = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distDir));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distDir, 'index.html'));
-    });
+  if (options?.includeErrorHandler !== false) {
+    attachErrorHandler(app);
   }
 
-  // Global Express Error Handler (JSON-safe, never leaks raw stack traces)
+  return app;
+}
+
+function attachErrorHandler(app: express.Express) {
   app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
     const errObj = err as { type?: string; status?: number; message?: string };
     if (errObj?.type === 'entity.parse.failed') {
@@ -3210,9 +3393,35 @@ async function startServer() {
       });
     }
   });
+}
 
-  app.listen(3000, '0.0.0.0', () => {
-    console.log('Emmystylez Solar Electrical Store running on http://0.0.0.0:3000');
+async function startServer() {
+  await hydrateFromSupabase();
+
+  const app = createApiApp({ includeErrorHandler: false });
+
+  // Vite / Static Serving
+  if (process.env.NODE_ENV !== 'production') {
+    const viteModule = 'vite';
+    const { createServer: createViteServer } = await import(/* @vite-ignore */ viteModule);
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distDir = path.resolve(process.cwd(), 'dist');
+    app.use(express.static(distDir));
+    app.get('*', (_req, res) => {
+      res.sendFile(path.join(distDir, 'index.html'));
+    });
+  }
+
+  attachErrorHandler(app);
+
+  const port = Number(process.env.PORT || 3000);
+  app.listen(port, '0.0.0.0', () => {
+    console.log(`Emmystylez Solar Electrical Store running on http://0.0.0.0:${port}`);
   });
 }
 
@@ -3224,7 +3433,10 @@ process.on('uncaughtException', (error) => {
   console.error('Uncaught Exception caught safely:', error);
 });
 
-startServer().catch((err) => {
-  console.error('Failed to start Emmystylez server:', err);
-  process.exit(1);
-});
+const entryArg = path.basename(process.argv[1] || '');
+if (!IS_SERVERLESS && (entryArg === 'server.ts' || entryArg === 'server.js')) {
+  startServer().catch((err) => {
+    console.error('Failed to start Emmystylez server:', err);
+    process.exit(1);
+  });
+}

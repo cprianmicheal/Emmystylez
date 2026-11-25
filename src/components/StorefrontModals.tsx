@@ -34,6 +34,7 @@ import {
 } from '../types';
 import { NIGERIA_LOCATIONS } from '../data/nigeriaLocations';
 import { downloadOrderInvoicePdf, formatNaira } from '../utils/invoicePdf';
+import { parseJsonResponseSafe, prepareMediaForUpload } from '../utils/mediaUpload';
 
 export interface CartItem {
   product: Product;
@@ -42,14 +43,6 @@ export interface CartItem {
 
 const getUnitPrice = (p: Product): number =>
   p.isFlashSale && p.flashSalePrice && p.flashSalePrice > 0 ? p.flashSalePrice : p.price;
-
-const readFileAsDataUrl = (file: File): Promise<string> =>
-  new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ''));
-    reader.onerror = () => reject(new Error('Failed to read file.'));
-    reader.readAsDataURL(file);
-  });
 
 interface ProductModalProps {
   product: Product | null;
@@ -604,24 +597,25 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     setUploadingReceipt(true);
     setError(null);
     try {
-      const dataBase64 = await readFileAsDataUrl(file);
+      const prepared = await prepareMediaForUpload(file);
       const res = await fetch('/api/orders/upload-receipt', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          filename: file.name,
-          dataBase64,
+          filename: prepared.filename,
+          mimeType: prepared.mimeType,
+          dataBase64: prepared.dataBase64,
         }),
       });
-      const json = await res.json();
-      if (!res.ok) {
+      const json = await parseJsonResponseSafe<{ url?: string; error?: string }>(res);
+      if (!res.ok || !json.url) {
         setError(json.error || 'Could not upload receipt.');
       } else {
         setReceiptUrl(json.url);
         setReceiptName(file.name);
       }
-    } catch {
-      setError('Error uploading payment receipt.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Error uploading payment receipt.');
     } finally {
       setUploadingReceipt(false);
     }
@@ -1277,9 +1271,12 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                                   <span>{receiptUrl ? 'Change Receipt File' : 'Browse Receipt File'}</span>
                                   <input
                                     type="file"
-                                    accept=".jpg,.jpeg,.png,.webp,.pdf"
+                                    accept="image/*,.pdf"
                                     className="hidden"
-                                    onChange={(e) => handleReceiptFiles(e.target.files)}
+                                    onChange={(e) => {
+                                      handleReceiptFiles(e.target.files);
+                                      e.target.value = '';
+                                    }}
                                   />
                                 </label>
                               </div>
